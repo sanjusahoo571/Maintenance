@@ -1,0 +1,115 @@
+name: Windows maintenance via Tailscale
+
+on:
+  workflow_dispatch:
+
+env:
+  RDP_USER: ${{ secrets.RDP_USER }}
+  RDP_PASS: ${{ secrets.RDP_PASS }}
+  TS_HOSTNAME: ${{ secrets.TS_HOSTNAME }}
+  TS_TAILNET: ${{ secrets.TS_TAILNET }}
+  TS_API_KEY: ${{ secrets.TS_API_KEY }}
+  TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}
+
+jobs:
+  windows-maintenance:
+    runs-on: windows-2022
+    timeout-minutes: 35
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop and disable Network Level Authentication (if needed)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove any existing rule with the same name to avoid duplication
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          
+          # For testing, allow any incoming connection on port 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            remoteip=100.64.0.0/10
+
+          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          $password = "${{ env.RDP_PASS }}"
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if ((Get-LocalUser -Name "${{ env.RDP_USER }}" -ErrorAction SilentlyContinue) -eq $null) {
+            New-LocalUser -Name "${{ env.RDP_USER }}" -Password $securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "${{ env.RDP_USER }}"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "${{ env.RDP_USER }}"
+
+          echo "::add-mask::$env:RDP_USER"
+          echo "::add-mask::$password"
+          echo "RDP_CREDS=User: *** | Password: ***" >> $env:GITHUB_ENV
+
+      - name: 🧹 PURGE any devices containing 'mansingh' (startup)
+        run: |
+          echo "::add-mask::$env:TS_API_KEY"
+          $hdr = @{ Authorization = "Bearer ***" }
+          $tn  = [uri]::EscapeDataString("$env:TS_TAILNET")
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers @{"Authorization"="Bearer $env:TS_API_KEY"} `
+            -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Verbose:$false
+            foreach ($d in $resp.devices) {
+              if ($d.name -match '(?i)mansingh') {
+                Invoke-RestMethod -Method DELETE -Headers @{"Authorization"="Bearer $env:TS_API_KEY"} `
+                  -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Verbose:$false | Out-Null
+                Write-Host "Deleted device: *** (matching pattern)"  # Hide name if needed
+              }
+            }
+          } catch { Write-Warning "Device cleanup failed" }
+
+      - name: ⚙️ Install Tailscale (if missing) & show version
+        run: |
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & "C:\Program Files\Tailscale\tailscale.exe" version
+
+      - name: 🔗 Tailscale up (hostname=mansingh) + show IP/FQDN/DERP
+        id: up
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          & $ts logout | Out-Null
+          & $ts up --authkey "$env:TS_AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
+
+          $ip4 = (& $ts ip -4 | Select-Object -First 1)
+          $status = & $ts status --json | ConvertFrom-Json
+          $fqdn = $status.Self.DNSName
+          $derp = $status.Self.DERP
+          "TAILSCALE_IP=$ip4" >> $env:GITHUB_ENV
+
+          "### RDP via Tailscale`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Short maintenance window
+        run: |
+          Write-Host "::add-mask::$env:RDP_PASS"
+          Write-Host "::add-mask::$env:RDP_USER"
+
+          # DO NOT write unmasked creds
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Tailscale Access Only (via MagicDNS)"
+          Write-Host "Details logged above (masked)"
+          Write-Host "==================`n"
+
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C to terminate"
+            Start-Sleep -Seconds 300
+          }
